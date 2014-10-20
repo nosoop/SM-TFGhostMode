@@ -10,7 +10,7 @@
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.1.0"     // Plugin version.
+#define PLUGIN_VERSION          "0.2.0"     // Plugin version.
 
 public Plugin:myinfo = {
     name = "[TF2] Ghost Mode",
@@ -20,12 +20,21 @@ public Plugin:myinfo = {
     url = "http://github.com/nosoop"
 }
 
+#define A_REALLY_LONG_TIME      9999999999.0
+
 new g_rgRespawnTimes[MAXPLAYERS+1];
 
 public OnPluginStart() {
+    // Ghost-on-death condition ("in hell") is applied on spawn.
     HookEvent("player_spawn", EventHook_OnPlayerSpawn);
     
-    // TODO Handle cases where players want to switch teams or go spectate or [...]
+    // Listen for a few commands to properly remove ghost condition on.
+    AddCommandListener(CommandListener_CancelGhostMode, "spectate");
+    
+    // TODO properly handle jointeam argument
+    AddCommandListener(CommandListener_CancelGhostMode, "jointeam");
+    
+    // TODO Check for other cases where we want to cancel ghost mode.
     
     // Late loads.
     for (new i = MaxClients; i > 0; --i) {
@@ -56,14 +65,21 @@ public Action:EventHook_OnPlayerSpawn(Handle:hEvent, const String:name[], bool:d
     new iClient = GetClientOfUserId(GetEventInt(hEvent, "userid"));
     
     // TODO make optional, random chance?
-    TF2_AddCondition(iClient, TFCond_HalloweenInHell, 9999999999.0);
+    // TODO change condition duration?
+    TF2_AddCondition(iClient, TFCond_HalloweenInHell, A_REALLY_LONG_TIME);
 }
 
 public TF2_OnConditionAdded(iClient, TFCond:condition) {
     if (condition == TFCond_HalloweenGhostMode) {
-        // TODO hide HUD
+        TF2_RemoveAllWeapons(iClient);
         PreparePlayerRespawn(iClient);
     }
+}
+
+public Action:CommandListener_CancelGhostMode(iClient, const String:command[], argc) {
+    TF2_RemoveCondition(iClient, TFCond_HalloweenInHell);
+    TF2_RemoveCondition(iClient, TFCond_HalloweenGhostMode);
+    return Plugin_Continue;
 }
 
 /**
@@ -71,14 +87,14 @@ public TF2_OnConditionAdded(iClient, TFCond:condition) {
  */
 PreparePlayerRespawn(iClient) {
     new TFTeam:iTeam = TFTeam:GetClientTeam(iClient);
-
+    
     if (iTeam <= TFTeam_Spectator) {
         return;
     }
     
     new Float:fRespawnTime = GetPlayerRespawnTime(iTeam);
     CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
-    // PrintToChat(iClient, "Respawning in %.2f...", fRespawnTime);
+    // TODO kill timer if respawned?
     
     // Creates "respawning in" center chat notification.
     g_rgRespawnTimes[iClient] = RoundFloat(fRespawnTime);
@@ -89,7 +105,7 @@ PreparePlayerRespawn(iClient) {
  * Starts the timer notification.
  */
 public Action:Timer_StartRespawnCountdown(Handle:hTimer, any:iClient) {
-    g_rgRespawnTimes[iClient]--;
+    g_rgRespawnTimes[iClient] -= 1;
     CreateTimer(1.0, Timer_RespawnCountdown, iClient, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
 }
 
@@ -102,15 +118,19 @@ public Action:Timer_RespawnCountdown(Handle:hTimer, any:iClient) {
         PrintCenterText(iClient, "Respawn in: %d seconds", g_rgRespawnTimes[iClient]);
     } else if (g_rgRespawnTimes[iClient] == 0) {
         PrintCenterText(iClient, "Prepare to respawn");
-    } else {
-        PrintCenterText(iClient, "");
+        Client_ScreenFadeIn(iClient, 512, 512, {255, 255, 255, 255});
     }
     
     if (g_rgRespawnTimes[iClient] < 0
             || !TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
             || GameRules_GetRoundState() == RoundState_TeamWin) {
-        KillTimer(hTimer);
+        OnRespawnCountdownClosed(hTimer, iClient);
     }
+}
+
+OnRespawnCountdownClosed(Handle:hTimer, iClient) {
+    KillTimer(hTimer);
+    PrintCenterText(iClient, "");
 }
 
 /**
@@ -162,4 +182,27 @@ stock Float:GetPlayerRespawnTime(TFTeam:iTeam) {
     }
 
     return fRespawnTime;
+}
+
+/**
+ * Fades a client's screen to a specified color.
+ * Sourced from SMLIB
+ */
+stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0, 0, 255}, bool:bReliable=true) {
+    new Handle:userMessage = StartMessageOne("Fade", iClient, (bReliable?USERMSG_RELIABLE:0));
+    
+    if (userMessage == INVALID_HANDLE) {
+        return false;
+    }
+    
+    BfWriteShort(userMessage, nDuration);
+    BfWriteShort(userMessage, nHoldtime);
+    BfWriteShort(userMessage, 0x0002);
+    BfWriteByte(userMessage, rgba[0]);
+    BfWriteByte(userMessage, rgba[1]);
+    BfWriteByte(userMessage, rgba[2]);
+    BfWriteByte(userMessage, rgba[3]);
+    EndMessage();
+    
+    return true;
 }

@@ -7,10 +7,11 @@
 #include <sourcemod>
 #include <tf2>
 #include <tf2_stocks>
+#include <tf2_morestocks>
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.2.0"     // Plugin version.
+#define PLUGIN_VERSION          "0.3.0"     // Plugin version.
 
 public Plugin:myinfo = {
     name = "[TF2] Ghost Mode",
@@ -27,6 +28,7 @@ new g_rgRespawnTimes[MAXPLAYERS+1];
 public OnPluginStart() {
     // Ghost-on-death condition ("in hell") is applied on spawn.
     HookEvent("player_spawn", EventHook_OnPlayerSpawn);
+    HookEvent("player_death", EventHook_OnPlayerDeath, EventHookMode_Post);
     
     // Listen for a few commands to properly remove ghost condition on.
     AddCommandListener(CommandListener_CancelGhostMode, "spectate");
@@ -44,6 +46,14 @@ public OnPluginStart() {
             if (TF2_IsPlayerInCondition(i, TFCond_HalloweenGhostMode)) {
                 PreparePlayerRespawn(i);
             }
+        }
+    }
+}
+
+public OnPluginEnd() {
+    for (new i = MaxClients; i > 0; --i) {
+        if (IsClientInGame(i)) {
+            CancelGhostMode(i);
         }
     }
 }
@@ -66,7 +76,35 @@ public Action:EventHook_OnPlayerSpawn(Handle:hEvent, const String:name[], bool:d
     
     // TODO make optional, random chance?
     // TODO change condition duration?
-    TF2_AddCondition(iClient, TFCond_HalloweenInHell, A_REALLY_LONG_TIME);
+    if (GetRandomFloat() < 1.0) {
+        TF2_AddCondition(iClient, TFCond_HalloweenInHell, A_REALLY_LONG_TIME);
+    }
+}
+
+public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:dontBroadcast) {
+    // Fix for arena mode (ghosted players are apparently still alive)
+    if (TF2_GetGameType() == TF2GameType_Arena) {
+        if (GetEventInt(hEvent, "death_flags") & TF_DEATHFLAG_DEADRINGER == TF_DEATHFLAG_DEADRINGER) {
+            return Plugin_Continue;
+        }
+    
+        new iClient = GetClientOfUserId(GetEventInt(hEvent, "userid")),
+            TFTeam:iTeam = TFTeam:GetClientTeam(iClient);
+
+        if (iTeam <= TFTeam_Spectator) {
+            return Plugin_Continue;
+        }
+        
+        if (IsTeamDead(iTeam)) {
+            new TFTeam:iOppositeTeam = iTeam == TFTeam_Red ? TFTeam_Blue : TFTeam_Red;
+            if (!IsTeamDead(iOppositeTeam)) {
+                SetRoundWinner(iTeam == TFTeam_Red ? TFTeam_Blue : TFTeam_Red);
+            } else {
+                SetRoundWinner(TFTeam_Unassigned);
+            }
+        }
+    }
+    return Plugin_Continue;
 }
 
 public TF2_OnConditionAdded(iClient, TFCond:condition) {
@@ -77,9 +115,17 @@ public TF2_OnConditionAdded(iClient, TFCond:condition) {
 }
 
 public Action:CommandListener_CancelGhostMode(iClient, const String:command[], argc) {
-    TF2_RemoveCondition(iClient, TFCond_HalloweenInHell);
-    TF2_RemoveCondition(iClient, TFCond_HalloweenGhostMode);
+    CancelGhostMode(iClient);
     return Plugin_Continue;
+}
+
+CancelGhostMode(iClient) {
+    TF2_RemoveCondition(iClient, TFCond_HalloweenInHell);
+    
+    if (TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)) {
+        TF2_RemoveCondition(iClient, TFCond_HalloweenGhostMode);
+        ForcePlayerSuicide(iClient);
+    }
 }
 
 /**
@@ -93,12 +139,16 @@ PreparePlayerRespawn(iClient) {
     }
     
     new Float:fRespawnTime = GetPlayerRespawnTime(iTeam);
-    CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
-    // TODO kill timer if respawned?
     
-    // Creates "respawning in" center chat notification.
-    g_rgRespawnTimes[iClient] = RoundFloat(fRespawnTime);
-    CreateTimer(FloatFraction(fRespawnTime), Timer_StartRespawnCountdown, iClient, TIMER_FLAG_NO_MAPCHANGE);
+    // If less than zero, not a valid spawn time.
+    if (fRespawnTime > 0.0) {
+        CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
+        // TODO kill timer if respawned and prevent class switches
+        
+        // Creates "respawning in" center chat notification.
+        g_rgRespawnTimes[iClient] = RoundFloat(fRespawnTime);
+        CreateTimer(FloatFraction(fRespawnTime), Timer_StartRespawnCountdown, iClient, TIMER_FLAG_NO_MAPCHANGE);
+    }
 }
 
 /**
@@ -147,12 +197,9 @@ public Action:Timer_GhostRespawn(Handle:hTimer, any:iClient) {
  * Allow ghosts to be seen only by dead players.
  */
 public Action:SDKHook_OnSetTransmit(iClient, iObservingClient) {
-    new bool:bObserverDeadOrGhost = TF2_IsPlayerInCondition(iObservingClient, TFCond_HalloweenGhostMode)
-            || !IsPlayerAlive(iObservingClient);
-    
     if (iClient != iObservingClient
             && TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
-            && !bObserverDeadOrGhost) {
+            && !IsPlayerDeadOrGhost(iObservingClient)) {
         return Plugin_Handled;
     }
     return Plugin_Continue;
@@ -205,4 +252,43 @@ stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0
     EndMessage();
     
     return true;
+}
+
+stock bool:IsPlayerDeadOrGhost(iClient) {
+    return TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
+            || !IsPlayerAlive(iClient);
+}
+
+stock bool:IsTeamDead(TFTeam:iTeam) {
+    for (new i = MaxClients; i > 0; --i) {
+        if (!IsClientInGame(i)) {
+            continue;
+        }
+        
+        new TFTeam:iCheckTeam = TFTeam:GetClientTeam(i);
+        if (iTeam != iCheckTeam) {
+            continue;
+        } else if (!IsPlayerDeadOrGhost(i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+stock SetRoundWinner(TFTeam:iTeam) {
+    new iEnt = -1;
+    iEnt = FindEntityByClassname(iEnt, "game_round_win");
+
+    if (iEnt < 1) {
+        iEnt = CreateEntityByName("game_round_win");
+        if (IsValidEntity(iEnt)) {
+            DispatchSpawn(iEnt);
+        } else {
+            ThrowError("Unable to find or create a game_round_win entity!");
+        }
+    }
+
+    SetVariantInt(_:iTeam);
+    AcceptEntityInput(iEnt, "SetTeam");
+    AcceptEntityInput(iEnt, "RoundWin");
 }

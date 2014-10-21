@@ -11,14 +11,14 @@
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.3.0"     // Plugin version.
+#define PLUGIN_VERSION          "0.3.1"     // Plugin version.
 
 public Plugin:myinfo = {
     name = "[TF2] Ghost Mode",
     author = "nosoop",
     description = "Implementation of Ghost Mode using Valve's ghost TFConds",
     version = PLUGIN_VERSION,
-    url = "http://github.com/nosoop"
+    url = "http://github.com/nosoop/SM-TFGhostMode"
 }
 
 #define A_REALLY_LONG_TIME      9999999999.0
@@ -82,6 +82,8 @@ public Action:EventHook_OnPlayerSpawn(Handle:hEvent, const String:name[], bool:d
 }
 
 public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:dontBroadcast) {
+    // TODO force respawn if arena round is not running
+
     // Fix for arena mode (ghosted players are apparently still alive)
     if (TF2_GetGameType() == TF2GameType_Arena) {
         if (GetEventInt(hEvent, "death_flags") & TF_DEATHFLAG_DEADRINGER == TF_DEATHFLAG_DEADRINGER) {
@@ -98,7 +100,7 @@ public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:d
         if (IsTeamDead(iTeam)) {
             new TFTeam:iOppositeTeam = iTeam == TFTeam_Red ? TFTeam_Blue : TFTeam_Red;
             if (!IsTeamDead(iOppositeTeam)) {
-                SetRoundWinner(iTeam == TFTeam_Red ? TFTeam_Blue : TFTeam_Red);
+                SetRoundWinner(iOppositeTeam);
             } else {
                 SetRoundWinner(TFTeam_Unassigned);
             }
@@ -214,7 +216,6 @@ public Action:SDKHook_OnSetTransmit(iClient, iObservingClient) {
  * Returns the amount of time until respawn, provided a client on the specified team died at the time this method is called.
  */
 stock Float:GetPlayerRespawnTime(TFTeam:iTeam) {
-    // TODO handle for arena, etc.
     if (iTeam <= TFTeam_Spectator) {
         ThrowError("Team must be a non-spectating team (input %d)", iTeam);
     }
@@ -254,11 +255,18 @@ stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0
     return true;
 }
 
+/**
+ * Checks if the specified client is alive and in ghost mode or dead.
+ */
 stock bool:IsPlayerDeadOrGhost(iClient) {
     return TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
             || !IsPlayerAlive(iClient);
 }
 
+/**
+ * Arena Mode hack:  Checks if an entire team is dead or are ghosts.
+ * Arena does not count players in ghost mode as dead players.
+ */
 stock bool:IsTeamDead(TFTeam:iTeam) {
     for (new i = MaxClients; i > 0; --i) {
         if (!IsClientInGame(i)) {
@@ -275,6 +283,9 @@ stock bool:IsTeamDead(TFTeam:iTeam) {
     return true;
 }
 
+/**
+ * Forces a round to end with a winning team.
+ */
 stock SetRoundWinner(TFTeam:iTeam) {
     new iEnt = -1;
     iEnt = FindEntityByClassname(iEnt, "game_round_win");

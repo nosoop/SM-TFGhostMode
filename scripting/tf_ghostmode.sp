@@ -7,11 +7,10 @@
 #include <sourcemod>
 #include <tf2>
 #include <tf2_stocks>
-#include <tf2_morestocks>
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.3.1"     // Plugin version.
+#define PLUGIN_VERSION          "0.4.0"     // Plugin version.
 
 public Plugin:myinfo = {
     name = "[TF2] Ghost Mode",
@@ -20,8 +19,6 @@ public Plugin:myinfo = {
     version = PLUGIN_VERSION,
     url = "http://github.com/nosoop/SM-TFGhostMode"
 }
-
-#define A_REALLY_LONG_TIME      9999999999.0
 
 new g_rgRespawnTimes[MAXPLAYERS+1];
 
@@ -42,6 +39,10 @@ public OnPluginStart() {
     for (new i = MaxClients; i > 0; --i) {
         if (IsClientInGame(i)) {
             OnClientPutInServer(i);
+            
+            if (IsPlayerAlive(i)) {
+                ApplyGhostifying(i);
+            }
             
             if (TF2_IsPlayerInCondition(i, TFCond_HalloweenGhostMode)) {
                 PreparePlayerRespawn(i);
@@ -77,7 +78,7 @@ public Action:EventHook_OnPlayerSpawn(Handle:hEvent, const String:name[], bool:d
     // TODO make optional, random chance?
     // TODO change condition duration?
     if (GetRandomFloat() < 1.0) {
-        TF2_AddCondition(iClient, TFCond_HalloweenInHell, A_REALLY_LONG_TIME);
+        ApplyGhostifying(iClient);
     }
 }
 
@@ -85,7 +86,7 @@ public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:d
     // TODO force respawn if arena round is not running
 
     // Fix for arena mode (ghosted players are apparently still alive)
-    if (TF2_GetGameType() == TF2GameType_Arena) {
+    if (IsArenaOrSuddenDeath()) {
         if (GetEventInt(hEvent, "death_flags") & TF_DEATHFLAG_DEADRINGER == TF_DEATHFLAG_DEADRINGER) {
             return Plugin_Continue;
         }
@@ -107,6 +108,10 @@ public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:d
         }
     }
     return Plugin_Continue;
+}
+
+ApplyGhostifying(iClient) {
+    TF2_AddCondition(iClient, TFCond_HalloweenInHell, -1.0);
 }
 
 public TF2_OnConditionAdded(iClient, TFCond:condition) {
@@ -142,15 +147,26 @@ PreparePlayerRespawn(iClient) {
     
     new Float:fRespawnTime = GetPlayerRespawnTime(iTeam);
     
+    if (fRespawnTime <= 0.0
+            && GameRules_GetRoundState() != RoundState_RoundRunning) {
+        fRespawnTime = 5.0;
+    }
+    
     // If less than zero, not a valid spawn time.
     if (fRespawnTime > 0.0) {
         CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
         // TODO kill timer if respawned and prevent class switches
-        
-        // Creates "respawning in" center chat notification.
-        g_rgRespawnTimes[iClient] = RoundFloat(fRespawnTime);
-        CreateTimer(FloatFraction(fRespawnTime), Timer_StartRespawnCountdown, iClient, TIMER_FLAG_NO_MAPCHANGE);
+
+        StartRespawnCountdown(iClient, fRespawnTime);
     }
+}
+
+/**
+ * Build the timer for respawning.
+ */
+StartRespawnCountdown(iClient, Float:fRespawnTime) {
+    g_rgRespawnTimes[iClient] = RoundToFloor(fRespawnTime);
+    CreateTimer(FloatFraction(fRespawnTime), Timer_StartRespawnCountdown, iClient, TIMER_FLAG_NO_MAPCHANGE);
 }
 
 /**
@@ -216,16 +232,29 @@ public Action:SDKHook_OnSetTransmit(iClient, iObservingClient) {
  * Returns the amount of time until respawn, provided a client on the specified team died at the time this method is called.
  */
 stock Float:GetPlayerRespawnTime(TFTeam:iTeam) {
+    static Handle:hCFreezeTime = INVALID_HANDLE,
+           Handle:hCFreezeTravelTime = INVALID_HANDLE;
+    
+    if (hCFreezeTime == INVALID_HANDLE) {
+        hCFreezeTime = FindConVar("spec_freeze_time");
+    }
+    
+    if (hCFreezeTravelTime == INVALID_HANDLE) {
+        hCFreezeTravelTime = FindConVar("spec_freeze_traveltime");
+    }
+    
+    new Float:fFreezecamTime = GetConVarFloat(hCFreezeTime) + GetConVarFloat(hCFreezeTravelTime);
+    
     if (iTeam <= TFTeam_Spectator) {
         ThrowError("Team must be a non-spectating team (input %d)", iTeam);
     }
-
+    
     new Float:fMinRespawnTime = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", _:iTeam);
-
+    // TODO Fix respawn time for cases where respawn waves show up in quick succession
     new Float:fRespawnTime = GameRules_GetPropFloat("m_flNextRespawnWave", _:iTeam) - GetGameTime();
     fRespawnTime += fMinRespawnTime;
     
-    if (fRespawnTime < fMinRespawnTime + FREEZECAM_TIME) {
+    if (fRespawnTime < fMinRespawnTime + fFreezecamTime) {
         fRespawnTime += fMinRespawnTime;
     }
 
@@ -261,6 +290,10 @@ stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0
 stock bool:IsPlayerDeadOrGhost(iClient) {
     return TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
             || !IsPlayerAlive(iClient);
+}
+
+stock bool:IsArenaOrSuddenDeath() {
+    return (GameRules_GetRoundState() == RoundState_Stalemate);
 }
 
 /**

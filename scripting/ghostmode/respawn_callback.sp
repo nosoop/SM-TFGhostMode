@@ -8,6 +8,7 @@ typedef RespawnTimerCallback = function void(int client, float flNextRespawnTime
 
 /**
  * Request the next available respawn timer for the given client, if any.
+ * Best to use in a `player_death` event callback.
  */
 stock void RequestNextRespawnTimer(int client, RespawnTimerCallback callback, any data = 0) {
 	int userid = GetClientUserId(client);

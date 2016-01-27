@@ -10,7 +10,7 @@
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.4.0"     // Plugin version.
+#define PLUGIN_VERSION          "0.4.1"     // Plugin version.
 
 public Plugin:myinfo = {
     name = "[TF2] Ghost Mode",
@@ -37,6 +37,7 @@ public OnPluginStart() {
     
     // Late loads.
     for (new i = MaxClients; i > 0; --i) {
+        
         if (IsClientInGame(i)) {
             OnClientPutInServer(i);
             
@@ -60,6 +61,8 @@ public OnPluginEnd() {
 }
 
 public OnMapStart() {
+    SDKHook(GetPlayerResourceEntity(), SDKHook_ThinkPost, SDKHook_OnResourceThinkPost);
+    
     // Precache ghost sounds.
     decl String:halloweenBoo[64];
     for (new i = 0; i < 7; i++) {
@@ -145,6 +148,8 @@ PreparePlayerRespawn(iClient) {
         return;
     }
     
+    SetEntProp(iClient, Prop_Send, "m_iHideHUD", 8);
+    
     new Float:fRespawnTime = GetPlayerRespawnTime(iTeam);
     
     if (fRespawnTime <= 0.0
@@ -156,7 +161,7 @@ PreparePlayerRespawn(iClient) {
     if (fRespawnTime > 0.0) {
         CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
         // TODO kill timer if respawned and prevent class switches
-
+        PrintToChat(iClient, "Respawning in %0.2f...", fRespawnTime);
         StartRespawnCountdown(iClient, fRespawnTime);
     }
 }
@@ -181,6 +186,9 @@ public Action:Timer_StartRespawnCountdown(Handle:hTimer, any:iClient) {
  * Shows respawn timer notification.  Updates every second while the player it is for is dead.
  */
 public Action:Timer_RespawnCountdown(Handle:hTimer, any:iClient) {
+    if (!IsClientConnected(iClient)) {
+        KillTimer(hTimer);
+    }
     g_rgRespawnTimes[iClient] -= 1;
     if (g_rgRespawnTimes[iClient] > 0) {
         PrintCenterText(iClient, "Respawn in: %d seconds", g_rgRespawnTimes[iClient]);
@@ -189,7 +197,8 @@ public Action:Timer_RespawnCountdown(Handle:hTimer, any:iClient) {
         Client_ScreenFadeIn(iClient, 512, 512, {255, 255, 255, 255});
     }
     
-    if (g_rgRespawnTimes[iClient] < 0
+    if (!IsClientInGame(iClient)
+            || g_rgRespawnTimes[iClient] < 0
             || !TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
             || GameRules_GetRoundState() == RoundState_TeamWin) {
         OnRespawnCountdownClosed(hTimer, iClient);
@@ -215,13 +224,34 @@ public Action:Timer_GhostRespawn(Handle:hTimer, any:iClient) {
  * Allow ghosts to be seen only by dead players.
  */
 public Action:SDKHook_OnSetTransmit(iClient, iObservingClient) {
-    if (iClient != iObservingClient
+    if (IsClientInGame(iClient)
+            && iClient != iObservingClient
             && TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
             && !IsPlayerDeadOrGhost(iObservingClient)) {
         return Plugin_Handled;
     }
     return Plugin_Continue;
 }
+
+/**
+ * Overrides the scoreboard 
+ */
+public SDKHook_OnResourceThinkPost(iResourceEntity) {
+    for (new i = MaxClients; i > 0; --i) {
+        new bAlive = GetEntProp(iResourceEntity, Prop_Send, "m_bAlive", _, i);
+        if (bAlive == 1 && IsClientConnected(i) && IsPlayerDeadOrGhost(i)) {
+            SetEntProp(iResourceEntity, Prop_Send, "m_bAlive", false, _, i);
+        }
+    }
+}
+ 
+public Action:SendProp_GhostModeDeadOverride(iResourceEntity, const String:propname[], &bAlive, iClient) {
+    if (bAlive == 1 && IsClientConnected(iClient) && IsPlayerDeadOrGhost(iClient)) {
+        bAlive = 0;
+        return Plugin_Changed;
+    }
+    return Plugin_Continue;
+}  
 
 /**
  * Amount of time to add to compensate for the freezecam.  Used in GetPlayerRespawnTime(client).
@@ -259,6 +289,39 @@ stock Float:GetPlayerRespawnTime(TFTeam:iTeam) {
     }
 
     return fRespawnTime;
+}
+
+stock Float:GetRespawnWaveTime(TFTeam:iTeam) {
+    if (iTeam <= TFTeam_Spectator) {
+        ThrowError("Team must be a non-spectating team (input %d)", iTeam);
+    }
+    
+    new Float:fNextRespawnWave = GameRules_GetPropFloat("m_flNextRespawnWave", _:iTeam),
+        Float:fRespawnTimeInterval = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", _:iTeam),
+        Float:fFreezeCamTime = GetGameTime() + GetFreezeCamTime();
+    
+    new Float:fRespawnWaveTime = fNextRespawnWave;
+    
+    if (fFreezeCamTime > fRespawnWaveTime) {
+        fRespawnWaveTime += fRespawnTimeInterval;
+    }
+    
+    return FloatCompare(fFreezeCamTime, fRespawnWaveTime) > 0 ? fFreezeCamTime : fRespawnWaveTime;
+}
+
+stock Float:GetFreezeCamTime() {
+    static Handle:hCFreezeTime = INVALID_HANDLE,
+           Handle:hCFreezeTravelTime = INVALID_HANDLE;
+    
+    if (hCFreezeTime == INVALID_HANDLE) {
+        hCFreezeTime = FindConVar("spec_freeze_time");
+    }
+    
+    if (hCFreezeTravelTime == INVALID_HANDLE) {
+        hCFreezeTravelTime = FindConVar("spec_freeze_traveltime");
+    }
+    
+    return GetConVarFloat(hCFreezeTime) + GetConVarFloat(hCFreezeTravelTime);
 }
 
 /**

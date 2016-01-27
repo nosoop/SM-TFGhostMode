@@ -10,9 +10,11 @@
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION          "0.4.1"     // Plugin version.
+#pragma newdecls required
 
-public Plugin:myinfo = {
+#define PLUGIN_VERSION          "0.5.0"     // Plugin version.
+
+public Plugin myinfo = {
     name = "[TF2] Ghost Mode",
     author = "nosoop",
     description = "Implementation of Ghost Mode using Valve's ghost TFConds",
@@ -20,316 +22,209 @@ public Plugin:myinfo = {
     url = "http://github.com/nosoop/SM-TFGhostMode"
 }
 
-new g_rgRespawnTimes[MAXPLAYERS+1];
+#include "ghostmode/respawn_callback.sp"
 
-public OnPluginStart() {
-    // Ghost-on-death condition ("in hell") is applied on spawn.
-    HookEvent("player_spawn", EventHook_OnPlayerSpawn);
-    HookEvent("player_death", EventHook_OnPlayerDeath, EventHookMode_Post);
-    
-    // Listen for a few commands to properly remove ghost condition on.
-    AddCommandListener(CommandListener_CancelGhostMode, "spectate");
-    
-    // TODO properly handle jointeam argument
-    AddCommandListener(CommandListener_CancelGhostMode, "jointeam");
-    
-    // TODO Check for other cases where we want to cancel ghost mode.
-    
-    // Late loads.
-    for (new i = MaxClients; i > 0; --i) {
-        
-        if (IsClientInGame(i)) {
-            OnClientPutInServer(i);
-            
-            if (IsPlayerAlive(i)) {
-                ApplyGhostifying(i);
-            }
-            
-            if (TF2_IsPlayerInCondition(i, TFCond_HalloweenGhostMode)) {
-                PreparePlayerRespawn(i);
-            }
-        }
-    }
+char TF_CLASSNAMES[][] = {
+	"", "scout", "sniper", "soldier", "demoman", "medic", "heavyweapons", "pyro", "spy", "engineer"
+};
+
+
+float m_flNextRespawnTime[MAXPLAYERS+1];
+float m_vecDeathPos[MAXPLAYERS+1][3];
+float m_vecDeathAng[MAXPLAYERS+1][3];
+
+public void OnPluginStart() {
+	HookEvent("player_death", OnPlayerDeath, EventHookMode_Post);
+	
+	// Listen for a few commands to properly remove ghost condition on.
+	AddCommandListener(CmdListen_CancelGhostMode, "spectate");
+	AddCommandListener(CmdListen_CancelGhostMode, "jointeam");
+	
+	// Listen to `joinclass` to prevent class switching in-spawn
+	AddCommandListener(CmdListen_ChangeClass, "joinclass");
+	
+	for (int i = MaxClients; i > 0; --i) {
+		if (IsClientInGame(i)) {
+			OnClientPutInServer(i);
+		}
+	}
 }
 
-public OnPluginEnd() {
-    for (new i = MaxClients; i > 0; --i) {
-        if (IsClientInGame(i)) {
-            CancelGhostMode(i);
-        }
-    }
+public void OnPluginEnd() {
+	for (int i = MaxClients; i > 0; --i) {
+		if (IsClientInGame(i)) {
+			CancelGhostMode(i);
+		}
+	}
 }
 
-public OnMapStart() {
-    SDKHook(GetPlayerResourceEntity(), SDKHook_ThinkPost, SDKHook_OnResourceThinkPost);
-    
-    // Precache ghost sounds.
-    decl String:halloweenBoo[64];
-    for (new i = 0; i < 7; i++) {
-        Format(halloweenBoo, sizeof(halloweenBoo), "vo/halloween_boo%d.wav", i+1);
-        PrecacheSound(halloweenBoo);
-    }
+public void OnMapStart() {
+	PrecacheScriptSound("Halloween.GhostBoo");
 }
 
-public OnClientPutInServer(iClient) {
-    SDKHook(iClient, SDKHook_SetTransmit, SDKHook_OnSetTransmit);
+public void OnClientPutInServer(int client) {
+	SDKHook(client, SDKHook_PostThink, OnGhostPostThink);
 }
 
-public Action:EventHook_OnPlayerSpawn(Handle:hEvent, const String:name[], bool:dontBroadcast) {
-    new iClient = GetClientOfUserId(GetEventInt(hEvent, "userid"));
-    
-    // TODO make optional, random chance?
-    // TODO change condition duration?
-    if (GetRandomFloat() < 1.0) {
-        ApplyGhostifying(iClient);
-    }
+public void OnPlayerDeath(Event event, const char[] name, bool dontBroadcast) {
+	int userid = event.GetInt("userid");
+	int client = GetClientOfUserId(userid);
+	
+	GetClientAbsOrigin(client, m_vecDeathPos[client]);
+	GetClientEyeAngles(client, m_vecDeathAng[client]);
+	
+	/*if (IsFakeClient(client)) {
+		// just to prove that respawn times match those of non-ghosted players
+		return;
+	}*/
+	
+	if (event.GetInt("deathflags") & TF_DEATHFLAG_DEADRINGER) {
+		DisplayGhostExplosion(client);
+		return;
+	}
+	
+	// Perform a callback on the next few frames until the respawn time is available
+	RequestNextRespawnTimer(client, OnClientHasActiveRespawnTimer);
 }
 
-public Action:EventHook_OnPlayerDeath(Handle:hEvent, const String:name[], bool:dontBroadcast) {
-    // TODO force respawn if arena round is not running
+public void OnGhostPostThink(int client) {
+	// very finicky
+	if (TF2_IsPlayerInCondition(client, TFCond_HalloweenGhostMode)) {
+		SetEntProp(GetPlayerResourceEntity(), Prop_Send, "m_bAlive", false, _, client);
+	}
+}
 
-    // Fix for arena mode (ghosted players are apparently still alive)
-    if (IsArenaOrSuddenDeath()) {
-        if (GetEventInt(hEvent, "death_flags") & TF_DEATHFLAG_DEADRINGER == TF_DEATHFLAG_DEADRINGER) {
-            return Plugin_Continue;
-        }
-    
-        new iClient = GetClientOfUserId(GetEventInt(hEvent, "userid")),
-            TFTeam:iTeam = TFTeam:GetClientTeam(iClient);
+/**
+ * Turns the player into a (dead) ghost with a respawn time.
+ * TODO handle arena mode?
+ */
+public void OnClientHasActiveRespawnTimer(int client, float flNextRespawnTime, any data) {
+	if (client == 0 || flNextRespawnTime < GetGameTime()) {
+		// invalid userid or invalid respawn time
+		return;
+	}
+	
+	int userid = GetClientUserId(client);
+	
+	m_flNextRespawnTime[client] = flNextRespawnTime;
+	
+	float flSecondsToNextRespawn = flNextRespawnTime - GetGameTime();
+	
+	// TODO configure a sane limit
+	static float flMaxTimerTime = 10.0;
+	
+	// off by two
+	float flActiveTimerTime = flSecondsToNextRespawn > flMaxTimerTime + 2.0 ? flMaxTimerTime + 2.0 : flSecondsToNextRespawn;
+	
+	// Create timers for PrintCenterText
+	for (float i = 0.0; i < flActiveTimerTime; i += 1.0) {
+		DataPack pack;
+		CreateDataTimer(flSecondsToNextRespawn - i, Timer_GhostRespawnTimer, pack, TIMER_FLAG_NO_MAPCHANGE);
+		pack.WriteCell(userid);
+		pack.WriteFloat(flNextRespawnTime);
+	}
+	
+	TF2_RespawnPlayer(client);
+	TeleportEntity(client, m_vecDeathPos[client], m_vecDeathAng[client], NULL_VECTOR);
+	
+	DisplayGhostExplosion(client);
+	
+	TF2_AddCondition(client, TFCond_HalloweenGhostMode);
+}
 
-        if (iTeam <= TFTeam_Spectator) {
-            return Plugin_Continue;
-        }
-        
-        if (IsTeamDead(iTeam)) {
-            new TFTeam:iOppositeTeam = iTeam == TFTeam_Red ? TFTeam_Blue : TFTeam_Red;
-            if (!IsTeamDead(iOppositeTeam)) {
-                SetRoundWinner(iOppositeTeam);
-            } else {
-                SetRoundWinner(TFTeam_Unassigned);
-            }
-        }
-    }
+public Action Timer_GhostRespawnTimer(Handle timer, DataPack data) {
+	data.Reset();
+	int client = GetClientOfUserId(data.ReadCell());
+	
+	if (client > 0 && IsClientInGame(client) && TF2_IsPlayerInCondition(client, TFCond_HalloweenGhostMode)) {
+		float flExpectedRespawnTime = data.ReadFloat();
+		if (m_flNextRespawnTime[client] != flExpectedRespawnTime) {
+			// wrong respawn time, don't use
+			// TODO store all of these in the player's own arraylist?
+			return Plugin_Handled;
+		}
+		
+		// TODO timer is showing every other number sometimes
+		int nSecondsToRespawn = RoundToFloor(m_flNextRespawnTime[client] - GetGameTime());
+		
+		if (nSecondsToRespawn > 0) {
+			if (nSecondsToRespawn == 1) {
+				// TODO localize to #game_respawntime_in_sec
+				PrintCenterText(client, "Respawn in: 1 second");
+			} else {
+				// TODO localize to #game_respawntime_in_secs
+				PrintCenterText(client, "Respawn in: %d seconds", nSecondsToRespawn);
+			}
+		} else { 
+			// clear center text
+			PrintCenterText(client, "");
+			if (nSecondsToRespawn == 0) {
+				int white[] = {255, 255, 255, 255};
+				ScreenFadeIn(client, 512, 512, white);
+			} else {
+				// time to respawn (-1)
+				DisplayGhostExplosion(int client);
+				TF2_RespawnPlayer(client);
+			}
+		}
+	}
+	return Plugin_Handled;
+}
+
+/**
+ * Spawns the "ghost appearation" particle effect on a player
+ */
+void DisplayGhostExplosion(int client) {
+	float vecEyePos[3];
+	GetClientEyePosition(client, vecEyePos);
+	vecEyePos[2] -= 32.0;
+	TF2_GenericBombExplode(vecEyePos, _, _, "ghost_appearation");
+}
+
+/**
+ * Hooks the `changeclass` command to prevent switching classes and respawning in the spawn room while being a ghost.
+ */
+public Action CmdListen_ChangeClass(int client, const char[] name, int argc) {
+	if (TF2_IsPlayerInCondition(client, TFCond_HalloweenGhostMode) && m_flNextRespawnTime[client] > GetGameTime()) {
+		// No way to check for respawn rooms without hooks so we'll just handle all of them
+		char buffer[256];
+		GetCmdArgString(buffer, sizeof(buffer));
+		
+		if (strlen(buffer) > 0) {
+			TFClassType desiredClass = view_as<TFClassType>(GetRandomInt(1, sizeof(TF_CLASSNAMES) - 1));
+			for (int i = 0; i < sizeof(TF_CLASSNAMES); i++) {
+				if (StrEqual(buffer, TF_CLASSNAMES[i])) {
+					desiredClass = view_as<TFClassType>(i);
+				}
+			}
+			// TODO use localized #game_respawn_as
+			SetEntProp(client, Prop_Send, "m_iDesiredPlayerClass", desiredClass);
+		}
+		return Plugin_Handled;
+	}
+	return Plugin_Continue;
+}
+
+/* Cancel Ghost Mode for a player */
+
+public Action CmdListen_CancelGhostMode(int client, const char[] name, int argc) {
+    CancelGhostMode(client);
     return Plugin_Continue;
 }
 
-ApplyGhostifying(iClient) {
-    TF2_AddCondition(iClient, TFCond_HalloweenInHell, -1.0);
-}
-
-public TF2_OnConditionAdded(iClient, TFCond:condition) {
-    if (condition == TFCond_HalloweenGhostMode) {
-        TF2_RemoveAllWeapons(iClient);
-        PreparePlayerRespawn(iClient);
-    }
-}
-
-public Action:CommandListener_CancelGhostMode(iClient, const String:command[], argc) {
-    CancelGhostMode(iClient);
-    return Plugin_Continue;
-}
-
-CancelGhostMode(iClient) {
-    TF2_RemoveCondition(iClient, TFCond_HalloweenInHell);
-    
-    if (TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)) {
-        TF2_RemoveCondition(iClient, TFCond_HalloweenGhostMode);
-        ForcePlayerSuicide(iClient);
+void CancelGhostMode(int client) {
+    if (TF2_IsPlayerInCondition(client, TFCond_HalloweenGhostMode)) {
+        TF2_RemoveCondition(client, TFCond_HalloweenGhostMode);
+        ForcePlayerSuicide(client);
     }
 }
 
 /**
- * Handles player respawns, attempting to accurately match the normal respawn time.
+ * Stock to make the screen fade in.
+ * Adapted from Fun Commands
  */
-PreparePlayerRespawn(iClient) {
-    new TFTeam:iTeam = TFTeam:GetClientTeam(iClient);
-    
-    if (iTeam <= TFTeam_Spectator) {
-        return;
-    }
-    
-    SetEntProp(iClient, Prop_Send, "m_iHideHUD", 8);
-    
-    new Float:fRespawnTime = GetPlayerRespawnTime(iTeam);
-    
-    if (fRespawnTime <= 0.0
-            && GameRules_GetRoundState() != RoundState_RoundRunning) {
-        fRespawnTime = 5.0;
-    }
-    
-    // If less than zero, not a valid spawn time.
-    if (fRespawnTime > 0.0) {
-        CreateTimer(fRespawnTime, Timer_GhostRespawn, iClient, TIMER_FLAG_NO_MAPCHANGE);
-        // TODO kill timer if respawned and prevent class switches
-        PrintToChat(iClient, "Respawning in %0.2f...", fRespawnTime);
-        StartRespawnCountdown(iClient, fRespawnTime);
-    }
-}
-
-/**
- * Build the timer for respawning.
- */
-StartRespawnCountdown(iClient, Float:fRespawnTime) {
-    g_rgRespawnTimes[iClient] = RoundToFloor(fRespawnTime);
-    CreateTimer(FloatFraction(fRespawnTime), Timer_StartRespawnCountdown, iClient, TIMER_FLAG_NO_MAPCHANGE);
-}
-
-/**
- * Starts the timer notification.
- */
-public Action:Timer_StartRespawnCountdown(Handle:hTimer, any:iClient) {
-    g_rgRespawnTimes[iClient] -= 1;
-    CreateTimer(1.0, Timer_RespawnCountdown, iClient, TIMER_REPEAT | TIMER_FLAG_NO_MAPCHANGE);
-}
-
-/**
- * Shows respawn timer notification.  Updates every second while the player it is for is dead.
- */
-public Action:Timer_RespawnCountdown(Handle:hTimer, any:iClient) {
-    if (!IsClientConnected(iClient)) {
-        KillTimer(hTimer);
-    }
-    g_rgRespawnTimes[iClient] -= 1;
-    if (g_rgRespawnTimes[iClient] > 0) {
-        PrintCenterText(iClient, "Respawn in: %d seconds", g_rgRespawnTimes[iClient]);
-    } else if (g_rgRespawnTimes[iClient] == 0) {
-        PrintCenterText(iClient, "Prepare to respawn");
-        Client_ScreenFadeIn(iClient, 512, 512, {255, 255, 255, 255});
-    }
-    
-    if (!IsClientInGame(iClient)
-            || g_rgRespawnTimes[iClient] < 0
-            || !TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
-            || GameRules_GetRoundState() == RoundState_TeamWin) {
-        OnRespawnCountdownClosed(hTimer, iClient);
-    }
-}
-
-OnRespawnCountdownClosed(Handle:hTimer, iClient) {
-    KillTimer(hTimer);
-    PrintCenterText(iClient, "");
-}
-
-/**
- * Timer that respawns a player while they are in ghost mode.
- * (Respawn time is set in PreparePlayerRespawn(iClient).)
- */
-public Action:Timer_GhostRespawn(Handle:hTimer, any:iClient) {
-    if (GameRules_GetRoundState() != RoundState_TeamWin) {
-        TF2_RespawnPlayer(iClient);
-    }
-}
-
-/**
- * Allow ghosts to be seen only by dead players.
- */
-public Action:SDKHook_OnSetTransmit(iClient, iObservingClient) {
-    if (IsClientInGame(iClient)
-            && iClient != iObservingClient
-            && TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
-            && !IsPlayerDeadOrGhost(iObservingClient)) {
-        return Plugin_Handled;
-    }
-    return Plugin_Continue;
-}
-
-/**
- * Overrides the scoreboard 
- */
-public SDKHook_OnResourceThinkPost(iResourceEntity) {
-    for (new i = MaxClients; i > 0; --i) {
-        new bAlive = GetEntProp(iResourceEntity, Prop_Send, "m_bAlive", _, i);
-        if (bAlive == 1 && IsClientConnected(i) && IsPlayerDeadOrGhost(i)) {
-            SetEntProp(iResourceEntity, Prop_Send, "m_bAlive", false, _, i);
-        }
-    }
-}
- 
-public Action:SendProp_GhostModeDeadOverride(iResourceEntity, const String:propname[], &bAlive, iClient) {
-    if (bAlive == 1 && IsClientConnected(iClient) && IsPlayerDeadOrGhost(iClient)) {
-        bAlive = 0;
-        return Plugin_Changed;
-    }
-    return Plugin_Continue;
-}  
-
-/**
- * Amount of time to add to compensate for the freezecam.  Used in GetPlayerRespawnTime(client).
- */
-#define FREEZECAM_TIME          5.0
-
-/**
- * Returns the amount of time until respawn, provided a client on the specified team died at the time this method is called.
- */
-stock Float:GetPlayerRespawnTime(TFTeam:iTeam) {
-    static Handle:hCFreezeTime = INVALID_HANDLE,
-           Handle:hCFreezeTravelTime = INVALID_HANDLE;
-    
-    if (hCFreezeTime == INVALID_HANDLE) {
-        hCFreezeTime = FindConVar("spec_freeze_time");
-    }
-    
-    if (hCFreezeTravelTime == INVALID_HANDLE) {
-        hCFreezeTravelTime = FindConVar("spec_freeze_traveltime");
-    }
-    
-    new Float:fFreezecamTime = GetConVarFloat(hCFreezeTime) + GetConVarFloat(hCFreezeTravelTime);
-    
-    if (iTeam <= TFTeam_Spectator) {
-        ThrowError("Team must be a non-spectating team (input %d)", iTeam);
-    }
-    
-    new Float:fMinRespawnTime = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", _:iTeam);
-    // TODO Fix respawn time for cases where respawn waves show up in quick succession
-    new Float:fRespawnTime = GameRules_GetPropFloat("m_flNextRespawnWave", _:iTeam) - GetGameTime();
-    fRespawnTime += fMinRespawnTime;
-    
-    if (fRespawnTime < fMinRespawnTime + fFreezecamTime) {
-        fRespawnTime += fMinRespawnTime;
-    }
-
-    return fRespawnTime;
-}
-
-stock Float:GetRespawnWaveTime(TFTeam:iTeam) {
-    if (iTeam <= TFTeam_Spectator) {
-        ThrowError("Team must be a non-spectating team (input %d)", iTeam);
-    }
-    
-    new Float:fNextRespawnWave = GameRules_GetPropFloat("m_flNextRespawnWave", _:iTeam),
-        Float:fRespawnTimeInterval = GameRules_GetPropFloat("m_TeamRespawnWaveTimes", _:iTeam),
-        Float:fFreezeCamTime = GetGameTime() + GetFreezeCamTime();
-    
-    new Float:fRespawnWaveTime = fNextRespawnWave;
-    
-    if (fFreezeCamTime > fRespawnWaveTime) {
-        fRespawnWaveTime += fRespawnTimeInterval;
-    }
-    
-    return FloatCompare(fFreezeCamTime, fRespawnWaveTime) > 0 ? fFreezeCamTime : fRespawnWaveTime;
-}
-
-stock Float:GetFreezeCamTime() {
-    static Handle:hCFreezeTime = INVALID_HANDLE,
-           Handle:hCFreezeTravelTime = INVALID_HANDLE;
-    
-    if (hCFreezeTime == INVALID_HANDLE) {
-        hCFreezeTime = FindConVar("spec_freeze_time");
-    }
-    
-    if (hCFreezeTravelTime == INVALID_HANDLE) {
-        hCFreezeTravelTime = FindConVar("spec_freeze_traveltime");
-    }
-    
-    return GetConVarFloat(hCFreezeTime) + GetConVarFloat(hCFreezeTravelTime);
-}
-
-/**
- * Fades a client's screen to a specified color.
- * Sourced from SMLIB
- */
-stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0, 0, 255}, bool:bReliable=true) {
-    new Handle:userMessage = StartMessageOne("Fade", iClient, (bReliable?USERMSG_RELIABLE:0));
+stock bool ScreenFadeIn(int client, int nDuration, int nHoldtime=-1, int rgba[4] = {0, 0, 0, 255}, bool bReliable=true) {
+    Handle userMessage = StartMessageOne("Fade", client, (bReliable?USERMSG_RELIABLE:0));
     
     if (userMessage == INVALID_HANDLE) {
         return false;
@@ -348,54 +243,27 @@ stock bool:Client_ScreenFadeIn(iClient, nDuration, nHoldtime=-1, rgba[4] = {0, 0
 }
 
 /**
- * Checks if the specified client is alive and in ghost mode or dead.
+ * Takes a `tf_generic_bomb` entity, sets it up and detonates it.
+ * Adapted from https://forums.alliedmods.net/showthread.php?t=272874
  */
-stock bool:IsPlayerDeadOrGhost(iClient) {
-    return TF2_IsPlayerInCondition(iClient, TFCond_HalloweenGhostMode)
-            || !IsPlayerAlive(iClient);
-}
+stock void TF2_GenericBombExplode(float vecOrigin[3], float flDamage = 0.0, float flRadius = 0.0,
+		const char[] strParticle = "", const char[] strSound = "") {
+	int iBomb = CreateEntityByName("tf_generic_bomb");
+	DispatchKeyValueVector(iBomb, "origin", vecOrigin);
+	DispatchKeyValueFloat(iBomb, "damage", flDamage);
+	DispatchKeyValueFloat(iBomb, "radius", flRadius);
+	DispatchKeyValue(iBomb, "health", "1");
+	
+	if (strlen(strParticle) > 0) {
+		DispatchKeyValue(iBomb, "explode_particle", strParticle);
+	}
+	
+	if (strlen(strSound) > 0) {
+		DispatchKeyValue(iBomb, "sound", strSound);
+	}
+	
+	DispatchSpawn(iBomb);
 
-stock bool:IsArenaOrSuddenDeath() {
-    return (GameRules_GetRoundState() == RoundState_Stalemate);
-}
-
-/**
- * Arena Mode hack:  Checks if an entire team is dead or are ghosts.
- * Arena does not count players in ghost mode as dead players.
- */
-stock bool:IsTeamDead(TFTeam:iTeam) {
-    for (new i = MaxClients; i > 0; --i) {
-        if (!IsClientInGame(i)) {
-            continue;
-        }
-        
-        new TFTeam:iCheckTeam = TFTeam:GetClientTeam(i);
-        if (iTeam != iCheckTeam) {
-            continue;
-        } else if (!IsPlayerDeadOrGhost(i)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/**
- * Forces a round to end with a winning team.
- */
-stock SetRoundWinner(TFTeam:iTeam) {
-    new iEnt = -1;
-    iEnt = FindEntityByClassname(iEnt, "game_round_win");
-
-    if (iEnt < 1) {
-        iEnt = CreateEntityByName("game_round_win");
-        if (IsValidEntity(iEnt)) {
-            DispatchSpawn(iEnt);
-        } else {
-            ThrowError("Unable to find or create a game_round_win entity!");
-        }
-    }
-
-    SetVariantInt(_:iTeam);
-    AcceptEntityInput(iEnt, "SetTeam");
-    AcceptEntityInput(iEnt, "RoundWin");
-}
+	AcceptEntityInput(iBomb, "Detonate");
+	AcceptEntityInput(iBomb, "Kill");
+}  
